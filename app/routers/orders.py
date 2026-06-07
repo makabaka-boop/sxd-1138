@@ -175,11 +175,27 @@ async def create_order(
     if not store:
         raise HTTPException(status_code=404, detail="门店不存在")
 
+    is_urgent = order_data.is_urgent or False
+    
+    if not is_urgent and order_data.urgent_remark:
+        raise HTTPException(status_code=400, detail="非加急订单不能填写加急备注")
+
+    for item_data in order_data.items:
+        service_item = db.query(ServiceItem).filter(
+            ServiceItem.id == item_data.service_item_id,
+            ServiceItem.store_id == order_data.store_id,
+            ServiceItem.is_active == True
+        ).first()
+        if not service_item:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"服务项目不存在或已下架: ID={item_data.service_item_id}"
+            )
+
     order_no = generate_order_no()
     pickup_code = generate_pickup_code()
     items_total = sum(item.subtotal for item in order_data.items)
     
-    is_urgent = order_data.is_urgent or False
     urgent_fee = 0.0
     if is_urgent:
         urgent_fee = calculate_urgent_fee(db, order_data.store_id, order_data.items)
@@ -197,7 +213,7 @@ async def create_order(
         remark=order_data.remark,
         operator_id=current_user.id,
         is_urgent=is_urgent,
-        urgent_remark=order_data.urgent_remark,
+        urgent_remark=order_data.urgent_remark if is_urgent else None,
         urgent_fee=urgent_fee
     )
     db.add(order)
@@ -311,6 +327,13 @@ async def update_order(
     
     items_total = sum(item.subtotal for item in order.items)
     
+    final_is_urgent = old_is_urgent
+    if "is_urgent" in update_data:
+        final_is_urgent = update_data["is_urgent"] or False
+    
+    if "urgent_remark" in update_data and not final_is_urgent:
+        raise HTTPException(status_code=400, detail="非加急订单不能填写加急备注")
+    
     if "is_urgent" in update_data:
         new_is_urgent = update_data["is_urgent"] or False
         if new_is_urgent != old_is_urgent:
@@ -319,6 +342,9 @@ async def update_order(
                 order.urgent_fee = calculate_urgent_fee(db, order.store_id, order.items)
             else:
                 order.urgent_fee = 0.0
+                order.urgent_remark = None
+                update_data["urgent_remark"] = None
+                urgent_remark_changed = True
             order.total_amount = items_total + (order.urgent_fee or 0.0)
     
     if "urgent_remark" in update_data:
