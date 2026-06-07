@@ -17,7 +17,9 @@ def init_data():
             name="总店",
             address="北京市朝阳区洗护路1号",
             phone="010-12345678",
-            manager="张经理"
+            manager="张经理",
+            default_urgent_fee=10.0,
+            default_urgent_description="24小时内取件"
         )
         db.add(store)
         db.flush()
@@ -53,11 +55,11 @@ def init_data():
         db.flush()
 
         services = [
-            ServiceItem(name="普通干洗", description="标准干洗服务", price=35.0, duration_minutes=60, store_id=store.id),
-            ServiceItem(name="高档西装干洗", description="高档面料专业干洗", price=88.0, duration_minutes=90, store_id=store.id),
-            ServiceItem(name="水洗", description="普通衣物水洗", price=20.0, duration_minutes=45, store_id=store.id),
-            ServiceItem(name="羽绒服清洗", description="羽绒服专业清洗", price=68.0, duration_minutes=120, store_id=store.id),
-            ServiceItem(name="皮衣护理", description="皮衣清洁保养", price=158.0, duration_minutes=180, store_id=store.id),
+            ServiceItem(name="普通干洗", description="标准干洗服务", price=35.0, duration_minutes=60, store_id=store.id, urgent_fee=15.0, urgent_description="当日取件"),
+            ServiceItem(name="高档西装干洗", description="高档面料专业干洗", price=88.0, duration_minutes=90, store_id=store.id, urgent_fee=30.0, urgent_description="当日取件"),
+            ServiceItem(name="水洗", description="普通衣物水洗", price=20.0, duration_minutes=45, store_id=store.id, urgent_fee=10.0, urgent_description="当日取件"),
+            ServiceItem(name="羽绒服清洗", description="羽绒服专业清洗", price=68.0, duration_minutes=120, store_id=store.id, urgent_fee=25.0, urgent_description="次日取件"),
+            ServiceItem(name="皮衣护理", description="皮衣清洁保养", price=158.0, duration_minutes=180, store_id=store.id, urgent_fee=50.0, urgent_description="次日取件"),
         ]
         db.add_all(services)
 

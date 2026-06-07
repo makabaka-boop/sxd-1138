@@ -6,7 +6,7 @@ import random
 import string
 from app.database import get_db
 from app.auth import require_operator, require_inspector, require_any_staff
-from app.models import Order, OrderItem, OrderStatusLog, User, Store
+from app.models import Order, OrderItem, OrderStatusLog, User, Store, ServiceItem
 from app.schemas import (
     OrderCreate, OrderUpdate, OrderResponse,
     OrderStatusUpdate, OrderStatusLogResponse,
@@ -38,7 +38,13 @@ def create_status_log(
     remark: Optional[str] = None,
     log_type: str = "status_change",
     suspend_reason: Optional[str] = None,
-    resume_result: Optional[str] = None
+    resume_result: Optional[str] = None,
+    urgent_changed: bool = False,
+    from_urgent: bool = False,
+    to_urgent: bool = False,
+    urgent_remark_changed: bool = False,
+    from_urgent_remark: Optional[str] = None,
+    to_urgent_remark: Optional[str] = None
 ):
     log = OrderStatusLog(
         order_id=order_id,
@@ -48,7 +54,13 @@ def create_status_log(
         remark=remark,
         log_type=log_type,
         suspend_reason=suspend_reason,
-        resume_result=resume_result
+        resume_result=resume_result,
+        urgent_changed=urgent_changed,
+        from_urgent=from_urgent,
+        to_urgent=to_urgent,
+        urgent_remark_changed=urgent_remark_changed,
+        from_urgent_remark=from_urgent_remark,
+        to_urgent_remark=to_urgent_remark
     )
     db.add(log)
     return log
@@ -82,6 +94,12 @@ def convert_order_to_response(order: Order) -> dict:
             "log_type": log.log_type,
             "suspend_reason": log.suspend_reason,
             "resume_result": log.resume_result,
+            "urgent_changed": log.urgent_changed or False,
+            "from_urgent": log.from_urgent or False,
+            "to_urgent": log.to_urgent or False,
+            "urgent_remark_changed": log.urgent_remark_changed or False,
+            "from_urgent_remark": log.from_urgent_remark,
+            "to_urgent_remark": log.to_urgent_remark,
             "created_at": log.created_at
         })
 
@@ -106,6 +124,9 @@ def convert_order_to_response(order: Order) -> dict:
         "suspended_by": order.suspended_by,
         "suspended_at": order.suspended_at,
         "suspended_by_name": suspended_by_name,
+        "is_urgent": order.is_urgent or False,
+        "urgent_remark": order.urgent_remark,
+        "urgent_fee": order.urgent_fee or 0.0,
         "created_at": order.created_at,
         "updated_at": order.updated_at,
         "items": items,
@@ -127,6 +148,23 @@ def require_suspend_operator_or_inspector(current_user: User = Depends(require_a
     return current_user
 
 
+def calculate_urgent_fee(db: Session, store_id: int, items: List) -> float:
+    total_urgent_fee = 0.0
+    for item_data in items:
+        service_item = db.query(ServiceItem).filter(
+            ServiceItem.id == item_data.service_item_id,
+            ServiceItem.store_id == store_id
+        ).first()
+        if service_item:
+            if service_item.urgent_fee and service_item.urgent_fee > 0:
+                total_urgent_fee += service_item.urgent_fee * item_data.quantity
+            else:
+                store = db.query(Store).filter(Store.id == store_id).first()
+                if store and store.default_urgent_fee and store.default_urgent_fee > 0:
+                    total_urgent_fee += store.default_urgent_fee * item_data.quantity
+    return total_urgent_fee
+
+
 @router.post("", response_model=OrderResponse, summary="创建订单（操作员登记收件）")
 async def create_order(
     order_data: OrderCreate,
@@ -139,7 +177,14 @@ async def create_order(
 
     order_no = generate_order_no()
     pickup_code = generate_pickup_code()
-    total_amount = sum(item.subtotal for item in order_data.items)
+    items_total = sum(item.subtotal for item in order_data.items)
+    
+    is_urgent = order_data.is_urgent or False
+    urgent_fee = 0.0
+    if is_urgent:
+        urgent_fee = calculate_urgent_fee(db, order_data.store_id, order_data.items)
+    
+    total_amount = items_total + urgent_fee
 
     order = Order(
         order_no=order_no,
@@ -150,7 +195,10 @@ async def create_order(
         total_amount=total_amount,
         pickup_code=pickup_code,
         remark=order_data.remark,
-        operator_id=current_user.id
+        operator_id=current_user.id,
+        is_urgent=is_urgent,
+        urgent_remark=order_data.urgent_remark,
+        urgent_fee=urgent_fee
     )
     db.add(order)
     db.flush()
@@ -167,18 +215,30 @@ async def create_order(
         )
         db.add(item)
 
+    log_remark = "订单创建"
+    if is_urgent:
+        log_remark += "（加急）"
+        if order_data.urgent_remark:
+            log_remark += f": {order_data.urgent_remark}"
+
     create_status_log(
         db=db,
         order_id=order.id,
         from_status=None,
         to_status=OrderStatus.PENDING_RECEIVE,
         operator_id=current_user.id,
-        remark="订单创建"
+        remark=log_remark,
+        urgent_changed=is_urgent,
+        from_urgent=False,
+        to_urgent=is_urgent,
+        urgent_remark_changed=order_data.urgent_remark is not None,
+        from_urgent_remark=None,
+        to_urgent_remark=order_data.urgent_remark
     )
 
     db.commit()
     order_full = get_order_with_relations(db, order.id)
-    logger.info(f"操作员 {current_user.username} 创建订单 {order_no}")
+    logger.info(f"操作员 {current_user.username} 创建订单 {order_no}" + ("（加急）" if is_urgent else ""))
     return convert_order_to_response(order_full)
 
 
@@ -190,6 +250,7 @@ async def get_orders(
     store_id: Optional[int] = None,
     keyword: Optional[str] = None,
     is_suspended: Optional[bool] = None,
+    is_urgent: Optional[bool] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_any_staff)
 ):
@@ -210,6 +271,8 @@ async def get_orders(
         )
     if is_suspended is not None:
         query = query.filter(Order.is_suspended == is_suspended)
+    if is_urgent is not None:
+        query = query.filter(Order.is_urgent == is_urgent)
     orders = query.order_by(Order.created_at.desc()).offset(skip).limit(limit).all()
     return [convert_order_to_response(o) for o in orders]
 
@@ -240,8 +303,57 @@ async def update_order(
         raise HTTPException(status_code=400, detail="订单已完成，不可修改")
 
     update_data = order_data.model_dump(exclude_unset=True)
+    
+    old_is_urgent = order.is_urgent or False
+    old_urgent_remark = order.urgent_remark
+    urgent_changed = False
+    urgent_remark_changed = False
+    
+    items_total = sum(item.subtotal for item in order.items)
+    
+    if "is_urgent" in update_data:
+        new_is_urgent = update_data["is_urgent"] or False
+        if new_is_urgent != old_is_urgent:
+            urgent_changed = True
+            if new_is_urgent:
+                order.urgent_fee = calculate_urgent_fee(db, order.store_id, order.items)
+            else:
+                order.urgent_fee = 0.0
+            order.total_amount = items_total + (order.urgent_fee or 0.0)
+    
+    if "urgent_remark" in update_data:
+        new_urgent_remark = update_data["urgent_remark"]
+        if new_urgent_remark != old_urgent_remark:
+            urgent_remark_changed = True
+    
     for key, value in update_data.items():
         setattr(order, key, value)
+    
+    if urgent_changed or urgent_remark_changed:
+        log_remark = "更新订单"
+        if urgent_changed:
+            if order.is_urgent:
+                log_remark += "，标记加急"
+            else:
+                log_remark += "，取消加急"
+        if urgent_remark_changed:
+            log_remark += f"，加急备注变更"
+        
+        create_status_log(
+            db=db,
+            order_id=order.id,
+            from_status=order.status,
+            to_status=order.status,
+            operator_id=current_user.id,
+            remark=log_remark,
+            log_type="urgent_change",
+            urgent_changed=urgent_changed,
+            from_urgent=old_is_urgent,
+            to_urgent=order.is_urgent or False,
+            urgent_remark_changed=urgent_remark_changed,
+            from_urgent_remark=old_urgent_remark,
+            to_urgent_remark=order.urgent_remark
+        )
 
     db.commit()
     order_full = get_order_with_relations(db, order.id)
@@ -652,6 +764,12 @@ async def get_order_logs(
             "log_type": log.log_type,
             "suspend_reason": log.suspend_reason,
             "resume_result": log.resume_result,
+            "urgent_changed": log.urgent_changed or False,
+            "from_urgent": log.from_urgent or False,
+            "to_urgent": log.to_urgent or False,
+            "urgent_remark_changed": log.urgent_remark_changed or False,
+            "from_urgent_remark": log.from_urgent_remark,
+            "to_urgent_remark": log.to_urgent_remark,
             "created_at": log.created_at
         })
 

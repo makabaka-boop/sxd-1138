@@ -32,6 +32,8 @@ class Store(Base):
     phone = Column(String(20))
     manager = Column(String(50))
     is_active = Column(Boolean, default=True)
+    default_urgent_fee = Column(Float, default=0.0)
+    default_urgent_description = Column(String(255))
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
@@ -50,6 +52,8 @@ class ServiceItem(Base):
     duration_minutes = Column(Integer)
     store_id = Column(Integer, ForeignKey("stores.id"))
     is_active = Column(Boolean, default=True)
+    urgent_fee = Column(Float, default=0.0)
+    urgent_description = Column(String(255))
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
@@ -91,6 +95,9 @@ class Order(Base):
     suspend_remark = Column(Text)
     suspended_by = Column(Integer, ForeignKey("users.id"))
     suspended_at = Column(DateTime)
+    is_urgent = Column(Boolean, default=False)
+    urgent_remark = Column(Text)
+    urgent_fee = Column(Float, default=0.0)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
@@ -131,6 +138,12 @@ class OrderStatusLog(Base):
     log_type = Column(String(20), default="status_change")
     suspend_reason = Column(String(50))
     resume_result = Column(Text)
+    urgent_changed = Column(Boolean, default=False)
+    from_urgent = Column(Boolean, default=False)
+    to_urgent = Column(Boolean, default=False)
+    urgent_remark_changed = Column(Boolean, default=False)
+    from_urgent_remark = Column(Text)
+    to_urgent_remark = Column(Text)
     created_at = Column(DateTime, default=datetime.now, nullable=False)
 
     order = relationship("Order", back_populates="status_logs")

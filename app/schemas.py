@@ -48,6 +48,8 @@ class StoreBase(BaseModel):
     address: Optional[str] = None
     phone: Optional[str] = None
     manager: Optional[str] = None
+    default_urgent_fee: Optional[float] = 0.0
+    default_urgent_description: Optional[str] = None
 
 
 class StoreCreate(StoreBase):
@@ -60,6 +62,8 @@ class StoreUpdate(BaseModel):
     phone: Optional[str] = None
     manager: Optional[str] = None
     is_active: Optional[bool] = None
+    default_urgent_fee: Optional[float] = None
+    default_urgent_description: Optional[str] = None
 
 
 class StoreResponse(StoreBase):
@@ -77,6 +81,8 @@ class ServiceItemBase(BaseModel):
     price: float
     duration_minutes: Optional[int] = None
     store_id: int
+    urgent_fee: Optional[float] = 0.0
+    urgent_description: Optional[str] = None
 
 
 class ServiceItemCreate(ServiceItemBase):
@@ -90,6 +96,8 @@ class ServiceItemUpdate(BaseModel):
     duration_minutes: Optional[int] = None
     store_id: Optional[int] = None
     is_active: Optional[bool] = None
+    urgent_fee: Optional[float] = None
+    urgent_description: Optional[str] = None
 
 
 class ServiceItemResponse(ServiceItemBase):
@@ -154,6 +162,8 @@ class OrderBase(BaseModel):
     customer_phone: str
     store_id: int
     remark: Optional[str] = None
+    is_urgent: Optional[bool] = False
+    urgent_remark: Optional[str] = None
 
 
 class OrderCreate(OrderBase):
@@ -164,6 +174,8 @@ class OrderUpdate(BaseModel):
     customer_name: Optional[str] = None
     customer_phone: Optional[str] = None
     remark: Optional[str] = None
+    is_urgent: Optional[bool] = None
+    urgent_remark: Optional[str] = None
 
 
 class OrderStatusUpdate(BaseModel):
@@ -181,6 +193,12 @@ class OrderStatusLogResponse(BaseModel):
     log_type: Optional[str] = None
     suspend_reason: Optional[str] = None
     resume_result: Optional[str] = None
+    urgent_changed: Optional[bool] = False
+    from_urgent: Optional[bool] = False
+    to_urgent: Optional[bool] = False
+    urgent_remark_changed: Optional[bool] = False
+    from_urgent_remark: Optional[str] = None
+    to_urgent_remark: Optional[str] = None
     created_at: datetime
     operator_name: Optional[str] = None
 
@@ -203,6 +221,8 @@ class OrderResponse(OrderBase):
     suspended_by: Optional[int] = None
     suspended_at: Optional[datetime] = None
     suspended_by_name: Optional[str] = None
+    is_urgent: bool = False
+    urgent_fee: float = 0.0
     created_at: datetime
     updated_at: datetime
     items: List[OrderItemResponse] = []

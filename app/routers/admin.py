@@ -309,6 +309,12 @@ def convert_admin_order_to_response(order: Order) -> dict:
             "log_type": log.log_type,
             "suspend_reason": log.suspend_reason,
             "resume_result": log.resume_result,
+            "urgent_changed": log.urgent_changed or False,
+            "from_urgent": log.from_urgent or False,
+            "to_urgent": log.to_urgent or False,
+            "urgent_remark_changed": log.urgent_remark_changed or False,
+            "from_urgent_remark": log.from_urgent_remark,
+            "to_urgent_remark": log.to_urgent_remark,
             "created_at": log.created_at
         })
 
@@ -333,6 +339,9 @@ def convert_admin_order_to_response(order: Order) -> dict:
         "suspended_by": order.suspended_by,
         "suspended_at": order.suspended_at,
         "suspended_by_name": suspended_by_name,
+        "is_urgent": order.is_urgent or False,
+        "urgent_remark": order.urgent_remark,
+        "urgent_fee": order.urgent_fee or 0.0,
         "created_at": order.created_at,
         "updated_at": order.updated_at,
         "items": items,
@@ -348,6 +357,7 @@ async def admin_get_orders(
     store_id: Optional[int] = None,
     keyword: Optional[str] = None,
     is_suspended: Optional[bool] = None,
+    is_urgent: Optional[bool] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin)
 ):
@@ -368,6 +378,8 @@ async def admin_get_orders(
         )
     if is_suspended is not None:
         query = query.filter(Order.is_suspended == is_suspended)
+    if is_urgent is not None:
+        query = query.filter(Order.is_urgent == is_urgent)
     orders = query.order_by(Order.created_at.desc()).offset(skip).limit(limit).all()
     return [convert_admin_order_to_response(o) for o in orders]
 
