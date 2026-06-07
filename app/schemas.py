@@ -1,7 +1,7 @@
 from pydantic import BaseModel, Field, computed_field
 from typing import Optional, List, Any
 from datetime import datetime, date
-from app.enums import OrderStatus, UserRole
+from app.enums import OrderStatus, UserRole, SuspendReason
 
 
 class Token(BaseModel):
@@ -178,6 +178,9 @@ class OrderStatusLogResponse(BaseModel):
     to_status: str
     operator_id: Optional[int]
     remark: Optional[str]
+    log_type: Optional[str] = None
+    suspend_reason: Optional[str] = None
+    resume_result: Optional[str] = None
     created_at: datetime
     operator_name: Optional[str] = None
 
@@ -193,6 +196,13 @@ class OrderResponse(OrderBase):
     pickup_code: Optional[str]
     operator_id: Optional[int]
     inspector_id: Optional[int]
+    is_suspended: bool = False
+    previous_status: Optional[str] = None
+    suspend_reason: Optional[str] = None
+    suspend_remark: Optional[str] = None
+    suspended_by: Optional[int] = None
+    suspended_at: Optional[datetime] = None
+    suspended_by_name: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     items: List[OrderItemResponse] = []
@@ -206,3 +216,13 @@ class AvailableTransitionsResponse(BaseModel):
     current_status: OrderStatus
     forward: List[OrderStatus]
     rollback: List[OrderStatus]
+
+
+class OrderSuspendRequest(BaseModel):
+    reason: SuspendReason
+    remark: Optional[str] = None
+
+
+class OrderResumeRequest(BaseModel):
+    result: Optional[str] = None
+    remark: Optional[str] = None

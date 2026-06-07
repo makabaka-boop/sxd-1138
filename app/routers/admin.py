@@ -1,15 +1,17 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
-from typing import List
+from sqlalchemy.orm import Session, joinedload
+from typing import List, Optional
 from app.database import get_db
 from app.auth import require_admin, get_current_active_user
-from app.models import Store, ServiceItem, User, EmployeeSchedule
+from app.models import Store, ServiceItem, User, EmployeeSchedule, Order, OrderStatusLog
 from app.schemas import (
     StoreCreate, StoreUpdate, StoreResponse,
     ServiceItemCreate, ServiceItemUpdate, ServiceItemResponse,
     UserCreate, UserUpdate, UserResponse,
-    EmployeeScheduleCreate, EmployeeScheduleUpdate, EmployeeScheduleResponse
+    EmployeeScheduleCreate, EmployeeScheduleUpdate, EmployeeScheduleResponse,
+    OrderResponse
 )
+from app.enums import OrderStatus
 from app.auth import get_password_hash
 from app.logger import logger
 
@@ -277,3 +279,113 @@ async def delete_schedule(
     db.commit()
     logger.info(f"管理员 {current_user.username} 删除排班 ID: {schedule_id}")
     return {"message": "排班已删除"}
+
+
+def convert_admin_order_to_response(order: Order) -> dict:
+    items = []
+    for item in order.items:
+        items.append({
+            "id": item.id,
+            "service_item_id": item.service_item_id,
+            "service_name": item.service_name,
+            "quantity": item.quantity,
+            "unit_price": item.unit_price,
+            "subtotal": item.subtotal,
+            "remark": item.remark,
+            "created_at": item.created_at
+        })
+
+    status_logs = []
+    for log in order.status_logs:
+        operator_name = log.operator.full_name if log.operator else None
+        status_logs.append({
+            "id": log.id,
+            "order_id": log.order_id,
+            "from_status": log.from_status,
+            "to_status": log.to_status,
+            "operator_id": log.operator_id,
+            "operator_name": operator_name,
+            "remark": log.remark,
+            "log_type": log.log_type,
+            "suspend_reason": log.suspend_reason,
+            "resume_result": log.resume_result,
+            "created_at": log.created_at
+        })
+
+    suspended_by_name = order.suspended_by_user.full_name if order.suspended_by_user else None
+
+    return {
+        "id": order.id,
+        "order_no": order.order_no,
+        "customer_name": order.customer_name,
+        "customer_phone": order.customer_phone,
+        "store_id": order.store_id,
+        "status": order.status,
+        "total_amount": order.total_amount,
+        "pickup_code": order.pickup_code,
+        "remark": order.remark,
+        "operator_id": order.operator_id,
+        "inspector_id": order.inspector_id,
+        "is_suspended": order.is_suspended or False,
+        "previous_status": order.previous_status,
+        "suspend_reason": order.suspend_reason,
+        "suspend_remark": order.suspend_remark,
+        "suspended_by": order.suspended_by,
+        "suspended_at": order.suspended_at,
+        "suspended_by_name": suspended_by_name,
+        "created_at": order.created_at,
+        "updated_at": order.updated_at,
+        "items": items,
+        "status_logs": status_logs
+    }
+
+
+@router.get("/orders", response_model=List[OrderResponse], summary="管理员获取订单列表（支持异常筛选）")
+async def admin_get_orders(
+    skip: int = 0,
+    limit: int = 100,
+    status: Optional[OrderStatus] = None,
+    store_id: Optional[int] = None,
+    keyword: Optional[str] = None,
+    is_suspended: Optional[bool] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin)
+):
+    query = db.query(Order).options(
+        joinedload(Order.items),
+        joinedload(Order.status_logs).joinedload(OrderStatusLog.operator),
+        joinedload(Order.suspended_by_user)
+    )
+    if status:
+        query = query.filter(Order.status == status)
+    if store_id:
+        query = query.filter(Order.store_id == store_id)
+    if keyword:
+        query = query.filter(
+            (Order.order_no.contains(keyword)) |
+            (Order.customer_name.contains(keyword)) |
+            (Order.customer_phone.contains(keyword))
+        )
+    if is_suspended is not None:
+        query = query.filter(Order.is_suspended == is_suspended)
+    orders = query.order_by(Order.created_at.desc()).offset(skip).limit(limit).all()
+    return [convert_admin_order_to_response(o) for o in orders]
+
+
+@router.get("/orders/suspended", response_model=List[OrderResponse], summary="获取所有挂起的异常订单")
+async def admin_get_suspended_orders(
+    skip: int = 0,
+    limit: int = 100,
+    store_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin)
+):
+    query = db.query(Order).options(
+        joinedload(Order.items),
+        joinedload(Order.status_logs).joinedload(OrderStatusLog.operator),
+        joinedload(Order.suspended_by_user)
+    ).filter(Order.is_suspended == True)
+    if store_id:
+        query = query.filter(Order.store_id == store_id)
+    orders = query.order_by(Order.suspended_at.desc()).offset(skip).limit(limit).all()
+    return [convert_admin_order_to_response(o) for o in orders]

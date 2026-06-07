@@ -5,14 +5,14 @@ from datetime import datetime
 import random
 import string
 from app.database import get_db
-from app.auth import require_operator, require_inspector, require_any_staff, get_current_active_user
+from app.auth import require_operator, require_inspector, require_any_staff, require_admin, get_current_active_user
 from app.models import Order, OrderItem, OrderStatusLog, User, Store
 from app.schemas import (
     OrderCreate, OrderUpdate, OrderResponse,
     OrderStatusUpdate, OrderStatusLogResponse,
-    AvailableTransitionsResponse
+    AvailableTransitionsResponse, OrderSuspendRequest, OrderResumeRequest
 )
-from app.enums import OrderStatus, STATUS_LABELS, UserRole
+from app.enums import OrderStatus, STATUS_LABELS, UserRole, SuspendReason, SUSPEND_REASON_LABELS
 from app.state_machine import OrderStateMachine, StateTransitionError
 from app.logger import logger
 
@@ -35,14 +35,20 @@ def create_status_log(
     from_status: Optional[str],
     to_status: str,
     operator_id: int,
-    remark: Optional[str] = None
+    remark: Optional[str] = None,
+    log_type: str = "status_change",
+    suspend_reason: Optional[str] = None,
+    resume_result: Optional[str] = None
 ):
     log = OrderStatusLog(
         order_id=order_id,
         from_status=from_status,
         to_status=to_status,
         operator_id=operator_id,
-        remark=remark
+        remark=remark,
+        log_type=log_type,
+        suspend_reason=suspend_reason,
+        resume_result=resume_result
     )
     db.add(log)
     return log
@@ -73,8 +79,13 @@ def convert_order_to_response(order: Order) -> dict:
             "operator_id": log.operator_id,
             "operator_name": operator_name,
             "remark": log.remark,
+            "log_type": log.log_type,
+            "suspend_reason": log.suspend_reason,
+            "resume_result": log.resume_result,
             "created_at": log.created_at
         })
+
+    suspended_by_name = order.suspended_by_user.full_name if order.suspended_by_user else None
 
     return {
         "id": order.id,
@@ -88,6 +99,13 @@ def convert_order_to_response(order: Order) -> dict:
         "remark": order.remark,
         "operator_id": order.operator_id,
         "inspector_id": order.inspector_id,
+        "is_suspended": order.is_suspended or False,
+        "previous_status": order.previous_status,
+        "suspend_reason": order.suspend_reason,
+        "suspend_remark": order.suspend_remark,
+        "suspended_by": order.suspended_by,
+        "suspended_at": order.suspended_at,
+        "suspended_by_name": suspended_by_name,
         "created_at": order.created_at,
         "updated_at": order.updated_at,
         "items": items,
@@ -98,7 +116,8 @@ def convert_order_to_response(order: Order) -> dict:
 def get_order_with_relations(db: Session, order_id: int) -> Optional[Order]:
     return db.query(Order).options(
         joinedload(Order.items),
-        joinedload(Order.status_logs).joinedload(OrderStatusLog.operator)
+        joinedload(Order.status_logs).joinedload(OrderStatusLog.operator),
+        joinedload(Order.suspended_by_user)
     ).filter(Order.id == order_id).first()
 
 
@@ -164,12 +183,14 @@ async def get_orders(
     status: Optional[OrderStatus] = None,
     store_id: Optional[int] = None,
     keyword: Optional[str] = None,
+    is_suspended: Optional[bool] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_any_staff)
 ):
     query = db.query(Order).options(
         joinedload(Order.items),
-        joinedload(Order.status_logs).joinedload(OrderStatusLog.operator)
+        joinedload(Order.status_logs).joinedload(OrderStatusLog.operator),
+        joinedload(Order.suspended_by_user)
     )
     if status:
         query = query.filter(Order.status == status)
@@ -181,6 +202,8 @@ async def get_orders(
             (Order.customer_name.contains(keyword)) |
             (Order.customer_phone.contains(keyword))
         )
+    if is_suspended is not None:
+        query = query.filter(Order.is_suspended == is_suspended)
     orders = query.order_by(Order.created_at.desc()).offset(skip).limit(limit).all()
     return [convert_order_to_response(o) for o in orders]
 
@@ -229,7 +252,10 @@ async def get_available_transitions(
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="订单不存在")
-    transitions = OrderStateMachine.get_available_transitions(OrderStatus(order.status))
+    transitions = OrderStateMachine.get_available_transitions(
+        OrderStatus(order.status), 
+        is_suspended=order.is_suspended or False
+    )
     return {
         "current_status": order.status,
         "forward": transitions["forward"],
@@ -264,6 +290,7 @@ async def update_order_status(
 
     current_status = OrderStatus(order.status)
     target_status = status_data.target_status
+    is_suspended = order.is_suspended or False
 
     if current_user.role == UserRole.INSPECTOR:
         if current_status not in INSPECTOR_ALLOWED_STATUSES:
@@ -285,7 +312,7 @@ async def update_order_status(
             raise HTTPException(status_code=403, detail="只有审核员可以执行质检退回")
 
     try:
-        OrderStateMachine.validate_transition(current_status, target_status)
+        OrderStateMachine.validate_transition(current_status, target_status, is_suspended)
     except StateTransitionError as e:
         raise HTTPException(status_code=400, detail=e.message)
 
@@ -332,9 +359,10 @@ async def receive_order(
 
     current_status = OrderStatus(order.status)
     target_status = OrderStatus.RECEIVED
+    is_suspended = order.is_suspended or False
 
     try:
-        OrderStateMachine.validate_transition(current_status, target_status)
+        OrderStateMachine.validate_transition(current_status, target_status, is_suspended)
     except StateTransitionError as e:
         raise HTTPException(status_code=400, detail=e.message)
 
@@ -370,9 +398,10 @@ async def process_order(
 
     current_status = OrderStatus(order.status)
     target_status = OrderStatus.PROCESSING
+    is_suspended = order.is_suspended or False
 
     try:
-        OrderStateMachine.validate_transition(current_status, target_status)
+        OrderStateMachine.validate_transition(current_status, target_status, is_suspended)
     except StateTransitionError as e:
         raise HTTPException(status_code=400, detail=e.message)
 
@@ -407,9 +436,10 @@ async def reprocess_order(
 
     current_status = OrderStatus(order.status)
     target_status = OrderStatus.PROCESSING
+    is_suspended = order.is_suspended or False
 
     try:
-        OrderStateMachine.validate_transition(current_status, target_status)
+        OrderStateMachine.validate_transition(current_status, target_status, is_suspended)
     except StateTransitionError as e:
         raise HTTPException(status_code=400, detail=e.message)
 
@@ -444,9 +474,10 @@ async def send_to_inspection(
 
     current_status = OrderStatus(order.status)
     target_status = OrderStatus.PENDING_INSPECTION
+    is_suspended = order.is_suspended or False
 
     try:
-        OrderStateMachine.validate_transition(current_status, target_status)
+        OrderStateMachine.validate_transition(current_status, target_status, is_suspended)
     except StateTransitionError as e:
         raise HTTPException(status_code=400, detail=e.message)
 
@@ -481,9 +512,10 @@ async def inspect_pass(
 
     current_status = OrderStatus(order.status)
     target_status = OrderStatus.PENDING_PICKUP
+    is_suspended = order.is_suspended or False
 
     try:
-        OrderStateMachine.validate_transition(current_status, target_status)
+        OrderStateMachine.validate_transition(current_status, target_status, is_suspended)
     except StateTransitionError as e:
         raise HTTPException(status_code=400, detail=e.message)
 
@@ -519,9 +551,10 @@ async def inspect_reject(
 
     current_status = OrderStatus(order.status)
     target_status = OrderStatus.RETURN_PROCESSING
+    is_suspended = order.is_suspended or False
 
     try:
-        OrderStateMachine.validate_transition(current_status, target_status)
+        OrderStateMachine.validate_transition(current_status, target_status, is_suspended)
     except StateTransitionError as e:
         raise HTTPException(status_code=400, detail=e.message)
 
@@ -557,9 +590,10 @@ async def complete_order(
 
     current_status = OrderStatus(order.status)
     target_status = OrderStatus.COMPLETED
+    is_suspended = order.is_suspended or False
 
     try:
-        OrderStateMachine.validate_transition(current_status, target_status)
+        OrderStateMachine.validate_transition(current_status, target_status, is_suspended)
     except StateTransitionError as e:
         raise HTTPException(status_code=400, detail=e.message)
 
@@ -606,6 +640,9 @@ async def get_order_logs(
             "operator_id": log.operator_id,
             "operator_name": operator_name,
             "remark": log.remark,
+            "log_type": log.log_type,
+            "suspend_reason": log.suspend_reason,
+            "resume_result": log.resume_result,
             "created_at": log.created_at
         })
 
@@ -633,3 +670,112 @@ async def send_pickup_notification(
         "customer_phone": order.customer_phone,
         "pickup_code": order.pickup_code
     }
+
+
+@router.post("/{order_id}/suspend", response_model=OrderResponse, summary="挂起订单")
+async def suspend_order(
+    order_id: int,
+    suspend_data: OrderSuspendRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_any_staff)
+):
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="订单不存在")
+
+    current_status = OrderStatus(order.status)
+    is_suspended = order.is_suspended or False
+
+    try:
+        OrderStateMachine.validate_suspend(current_status, is_suspended)
+    except StateTransitionError as e:
+        raise HTTPException(status_code=400, detail=e.message)
+
+    from_status = order.status
+    order.previous_status = from_status
+    order.status = OrderStatus.SUSPENDED
+    order.is_suspended = True
+    order.suspend_reason = suspend_data.reason
+    order.suspend_remark = suspend_data.remark
+    order.suspended_by = current_user.id
+    order.suspended_at = datetime.now()
+
+    reason_label = SUSPEND_REASON_LABELS.get(suspend_data.reason, suspend_data.reason)
+    remark = suspend_data.remark or f"挂起原因: {reason_label}"
+
+    create_status_log(
+        db=db,
+        order_id=order.id,
+        from_status=from_status,
+        to_status=OrderStatus.SUSPENDED,
+        operator_id=current_user.id,
+        remark=remark,
+        log_type="suspend",
+        suspend_reason=suspend_data.reason
+    )
+
+    db.commit()
+    order_full = get_order_with_relations(db, order.id)
+    logger.info(
+        f"用户 {current_user.username} 挂起订单 {order.order_no}，原因: {reason_label}"
+    )
+    return convert_order_to_response(order_full)
+
+
+@router.post("/{order_id}/resume", response_model=OrderResponse, summary="恢复订单")
+async def resume_order(
+    order_id: int,
+    resume_data: OrderResumeRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_any_staff)
+):
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="订单不存在")
+
+    is_suspended = order.is_suspended or False
+
+    try:
+        OrderStateMachine.validate_resume(is_suspended)
+    except StateTransitionError as e:
+        raise HTTPException(status_code=400, detail=e.message)
+
+    if current_user.role != UserRole.ADMIN and order.suspended_by != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="只有管理员或原挂起人可以恢复订单"
+        )
+
+    from_status = order.status
+    target_status = order.previous_status
+    if not target_status:
+        raise HTTPException(status_code=400, detail="订单挂起前状态丢失，无法恢复")
+
+    order.status = target_status
+    order.is_suspended = False
+
+    remark = resume_data.remark or f"恢复订单，处理结果: {resume_data.result or '已处理'}"
+
+    create_status_log(
+        db=db,
+        order_id=order.id,
+        from_status=from_status,
+        to_status=target_status,
+        operator_id=current_user.id,
+        remark=remark,
+        log_type="resume",
+        resume_result=resume_data.result
+    )
+
+    order.previous_status = None
+    order.suspend_reason = None
+    order.suspend_remark = None
+    order.suspended_by = None
+    order.suspended_at = None
+
+    db.commit()
+    order_full = get_order_with_relations(db, order.id)
+    logger.info(
+        f"用户 {current_user.username} 恢复订单 {order.order_no}，处理结果: {resume_data.result or '已处理'}"
+    )
+    return convert_order_to_response(order_full)

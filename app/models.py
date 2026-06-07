@@ -85,6 +85,12 @@ class Order(Base):
     remark = Column(Text)
     operator_id = Column(Integer, ForeignKey("users.id"))
     inspector_id = Column(Integer, ForeignKey("users.id"))
+    is_suspended = Column(Boolean, default=False)
+    previous_status = Column(String(30))
+    suspend_reason = Column(String(50))
+    suspend_remark = Column(Text)
+    suspended_by = Column(Integer, ForeignKey("users.id"))
+    suspended_at = Column(DateTime)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
@@ -93,6 +99,7 @@ class Order(Base):
     status_logs = relationship("OrderStatusLog", back_populates="order", cascade="all, delete-orphan", order_by="OrderStatusLog.id")
     operator = relationship("User", foreign_keys=[operator_id])
     inspector = relationship("User", foreign_keys=[inspector_id])
+    suspended_by_user = relationship("User", foreign_keys=[suspended_by])
 
 
 class OrderItem(Base):
@@ -121,6 +128,9 @@ class OrderStatusLog(Base):
     to_status = Column(String(30), nullable=False)
     operator_id = Column(Integer, ForeignKey("users.id"))
     remark = Column(Text)
+    log_type = Column(String(20), default="status_change")
+    suspend_reason = Column(String(50))
+    resume_result = Column(Text)
     created_at = Column(DateTime, default=datetime.now, nullable=False)
 
     order = relationship("Order", back_populates="status_logs")
