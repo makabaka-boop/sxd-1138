@@ -5,7 +5,7 @@ from datetime import datetime
 import random
 import string
 from app.database import get_db
-from app.auth import require_operator, require_inspector, require_any_staff, require_admin, get_current_active_user
+from app.auth import require_operator, require_inspector, require_any_staff
 from app.models import Order, OrderItem, OrderStatusLog, User, Store
 from app.schemas import (
     OrderCreate, OrderUpdate, OrderResponse,
@@ -119,6 +119,12 @@ def get_order_with_relations(db: Session, order_id: int) -> Optional[Order]:
         joinedload(Order.status_logs).joinedload(OrderStatusLog.operator),
         joinedload(Order.suspended_by_user)
     ).filter(Order.id == order_id).first()
+
+
+def require_suspend_operator_or_inspector(current_user: User = Depends(require_any_staff)) -> User:
+    if current_user.role not in [UserRole.OPERATOR, UserRole.INSPECTOR]:
+        raise HTTPException(status_code=403, detail="只有操作员或审核员可以挂起订单")
+    return current_user
 
 
 @router.post("", response_model=OrderResponse, summary="创建订单（操作员登记收件）")
@@ -291,6 +297,9 @@ async def update_order_status(
     current_status = OrderStatus(order.status)
     target_status = status_data.target_status
     is_suspended = order.is_suspended or False
+
+    if is_suspended:
+        raise HTTPException(status_code=400, detail="订单已挂起，请先恢复后再进行状态变更")
 
     if current_user.role == UserRole.INSPECTOR:
         if current_status not in INSPECTOR_ALLOWED_STATUSES:
@@ -677,7 +686,7 @@ async def suspend_order(
     order_id: int,
     suspend_data: OrderSuspendRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_any_staff)
+    current_user: User = Depends(require_suspend_operator_or_inspector)
 ):
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
@@ -740,10 +749,13 @@ async def resume_order(
     except StateTransitionError as e:
         raise HTTPException(status_code=400, detail=e.message)
 
-    if current_user.role != UserRole.ADMIN and order.suspended_by != current_user.id:
+    suspended_by_user = db.query(User).filter(User.id == order.suspended_by).first() if order.suspended_by else None
+    suspended_by_role = suspended_by_user.role if suspended_by_user else None
+
+    if current_user.role != UserRole.ADMIN and current_user.role != suspended_by_role:
         raise HTTPException(
             status_code=403,
-            detail="只有管理员或原挂起人可以恢复订单"
+            detail="只有管理员或原角色人员可以恢复订单"
         )
 
     from_status = order.status
