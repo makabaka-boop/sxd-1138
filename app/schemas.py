@@ -1,5 +1,5 @@
-from pydantic import BaseModel, Field
-from typing import Optional, List
+from pydantic import BaseModel, Field, computed_field
+from typing import Optional, List, Any
 from datetime import datetime, date
 from app.enums import OrderStatus, UserRole
 
@@ -177,9 +177,9 @@ class OrderStatusLogResponse(BaseModel):
     from_status: Optional[str]
     to_status: str
     operator_id: Optional[int]
-    operator_name: Optional[str]
     remark: Optional[str]
     created_at: datetime
+    operator_name: Optional[str] = None
 
     class Config:
         from_attributes = True

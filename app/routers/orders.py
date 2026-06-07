@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from typing import List, Optional
 from datetime import datetime
 import random
@@ -46,6 +46,60 @@ def create_status_log(
     )
     db.add(log)
     return log
+
+
+def convert_order_to_response(order: Order) -> dict:
+    items = []
+    for item in order.items:
+        items.append({
+            "id": item.id,
+            "service_item_id": item.service_item_id,
+            "service_name": item.service_name,
+            "quantity": item.quantity,
+            "unit_price": item.unit_price,
+            "subtotal": item.subtotal,
+            "remark": item.remark,
+            "created_at": item.created_at
+        })
+
+    status_logs = []
+    for log in order.status_logs:
+        operator_name = log.operator.full_name if log.operator else None
+        status_logs.append({
+            "id": log.id,
+            "order_id": log.order_id,
+            "from_status": log.from_status,
+            "to_status": log.to_status,
+            "operator_id": log.operator_id,
+            "operator_name": operator_name,
+            "remark": log.remark,
+            "created_at": log.created_at
+        })
+
+    return {
+        "id": order.id,
+        "order_no": order.order_no,
+        "customer_name": order.customer_name,
+        "customer_phone": order.customer_phone,
+        "store_id": order.store_id,
+        "status": order.status,
+        "total_amount": order.total_amount,
+        "pickup_code": order.pickup_code,
+        "remark": order.remark,
+        "operator_id": order.operator_id,
+        "inspector_id": order.inspector_id,
+        "created_at": order.created_at,
+        "updated_at": order.updated_at,
+        "items": items,
+        "status_logs": status_logs
+    }
+
+
+def get_order_with_relations(db: Session, order_id: int) -> Optional[Order]:
+    return db.query(Order).options(
+        joinedload(Order.items),
+        joinedload(Order.status_logs).joinedload(OrderStatusLog.operator)
+    ).filter(Order.id == order_id).first()
 
 
 @router.post("", response_model=OrderResponse, summary="创建订单（操作员登记收件）")
@@ -98,9 +152,9 @@ async def create_order(
     )
 
     db.commit()
-    db.refresh(order)
+    order_full = get_order_with_relations(db, order.id)
     logger.info(f"操作员 {current_user.username} 创建订单 {order_no}")
-    return order
+    return convert_order_to_response(order_full)
 
 
 @router.get("", response_model=List[OrderResponse], summary="获取订单列表")
@@ -113,7 +167,10 @@ async def get_orders(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_any_staff)
 ):
-    query = db.query(Order)
+    query = db.query(Order).options(
+        joinedload(Order.items),
+        joinedload(Order.status_logs).joinedload(OrderStatusLog.operator)
+    )
     if status:
         query = query.filter(Order.status == status)
     if store_id:
@@ -125,7 +182,7 @@ async def get_orders(
             (Order.customer_phone.contains(keyword))
         )
     orders = query.order_by(Order.created_at.desc()).offset(skip).limit(limit).all()
-    return orders
+    return [convert_order_to_response(o) for o in orders]
 
 
 @router.get("/{order_id}", response_model=OrderResponse, summary="获取订单详情")
@@ -134,10 +191,10 @@ async def get_order(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_any_staff)
 ):
-    order = db.query(Order).filter(Order.id == order_id).first()
+    order = get_order_with_relations(db, order_id)
     if not order:
         raise HTTPException(status_code=404, detail="订单不存在")
-    return order
+    return convert_order_to_response(order)
 
 
 @router.put("/{order_id}", response_model=OrderResponse, summary="更新订单基本信息")
@@ -158,9 +215,9 @@ async def update_order(
         setattr(order, key, value)
 
     db.commit()
-    db.refresh(order)
+    order_full = get_order_with_relations(db, order.id)
     logger.info(f"操作员 {current_user.username} 更新订单 {order.order_no}")
-    return order
+    return convert_order_to_response(order_full)
 
 
 @router.get("/{order_id}/transitions", response_model=AvailableTransitionsResponse, summary="获取订单可流转状态")
@@ -180,6 +237,20 @@ async def get_available_transitions(
     }
 
 
+INSPECTOR_ALLOWED_STATUSES = [
+    OrderStatus.PENDING_INSPECTION,
+    OrderStatus.RETURN_PROCESSING,
+    OrderStatus.PENDING_PICKUP,
+]
+
+OPERATOR_ALLOWED_STATUSES = [
+    OrderStatus.PENDING_RECEIVE,
+    OrderStatus.RECEIVED,
+    OrderStatus.PROCESSING,
+    OrderStatus.RETURN_PROCESSING,
+]
+
+
 @router.post("/{order_id}/status", response_model=OrderResponse, summary="更新订单状态")
 async def update_order_status(
     order_id: int,
@@ -193,6 +264,17 @@ async def update_order_status(
 
     current_status = OrderStatus(order.status)
     target_status = status_data.target_status
+
+    if current_user.role == UserRole.INSPECTOR:
+        if current_status not in INSPECTOR_ALLOWED_STATUSES:
+            raise HTTPException(
+                status_code=403,
+                detail=f"审核员只能处理质检阶段的订单，当前状态为 {STATUS_LABELS.get(current_status)}"
+            )
+
+    if current_user.role == UserRole.OPERATOR:
+        if target_status in [OrderStatus.PENDING_PICKUP, OrderStatus.COMPLETED, OrderStatus.RETURN_PROCESSING]:
+            raise HTTPException(status_code=403, detail="操作员无权执行质检或取件确认操作")
 
     if target_status in [OrderStatus.PENDING_PICKUP, OrderStatus.COMPLETED]:
         if current_user.role not in [UserRole.ADMIN, UserRole.INSPECTOR]:
@@ -229,12 +311,12 @@ async def update_order_status(
     )
 
     db.commit()
-    db.refresh(order)
+    order_full = get_order_with_relations(db, order.id)
     logger.info(
         f"用户 {current_user.username} 将订单 {order.order_no} 状态从 {from_status} "
         f"{transition_type} 为 {target_status}"
     )
-    return order
+    return convert_order_to_response(order_full)
 
 
 @router.post("/{order_id}/receive", response_model=OrderResponse, summary="确认收件（操作员）")
@@ -270,9 +352,9 @@ async def receive_order(
     )
 
     db.commit()
-    db.refresh(order)
+    order_full = get_order_with_relations(db, order.id)
     logger.info(f"操作员 {current_user.username} 确认收件: 订单 {order.order_no}")
-    return order
+    return convert_order_to_response(order_full)
 
 
 @router.post("/{order_id}/process", response_model=OrderResponse, summary="开始处理（操作员）")
@@ -307,9 +389,46 @@ async def process_order(
     )
 
     db.commit()
-    db.refresh(order)
+    order_full = get_order_with_relations(db, order.id)
     logger.info(f"操作员 {current_user.username} 开始处理: 订单 {order.order_no}")
-    return order
+    return convert_order_to_response(order_full)
+
+
+@router.post("/{order_id}/reprocess", response_model=OrderResponse, summary="退回后重新处理（操作员）")
+async def reprocess_order(
+    order_id: int,
+    remark: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_operator)
+):
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="订单不存在")
+
+    current_status = OrderStatus(order.status)
+    target_status = OrderStatus.PROCESSING
+
+    try:
+        OrderStateMachine.validate_transition(current_status, target_status)
+    except StateTransitionError as e:
+        raise HTTPException(status_code=400, detail=e.message)
+
+    from_status = order.status
+    order.status = target_status
+
+    create_status_log(
+        db=db,
+        order_id=order.id,
+        from_status=from_status,
+        to_status=target_status,
+        operator_id=current_user.id,
+        remark=remark or "退回后重新处理"
+    )
+
+    db.commit()
+    order_full = get_order_with_relations(db, order.id)
+    logger.info(f"操作员 {current_user.username} 退回后重新处理: 订单 {order.order_no}")
+    return convert_order_to_response(order_full)
 
 
 @router.post("/{order_id}/to-inspection", response_model=OrderResponse, summary="提交质检（操作员）")
@@ -344,9 +463,9 @@ async def send_to_inspection(
     )
 
     db.commit()
-    db.refresh(order)
+    order_full = get_order_with_relations(db, order.id)
     logger.info(f"操作员 {current_user.username} 提交质检: 订单 {order.order_no}")
-    return order
+    return convert_order_to_response(order_full)
 
 
 @router.post("/{order_id}/inspect-pass", response_model=OrderResponse, summary="质检通过（审核员）")
@@ -382,9 +501,9 @@ async def inspect_pass(
     )
 
     db.commit()
-    db.refresh(order)
+    order_full = get_order_with_relations(db, order.id)
     logger.info(f"审核员 {current_user.username} 质检通过: 订单 {order.order_no}，通知客户取件")
-    return order
+    return convert_order_to_response(order_full)
 
 
 @router.post("/{order_id}/inspect-reject", response_model=OrderResponse, summary="质检退回（审核员）")
@@ -420,9 +539,9 @@ async def inspect_reject(
     )
 
     db.commit()
-    db.refresh(order)
+    order_full = get_order_with_relations(db, order.id)
     logger.warning(f"审核员 {current_user.username} 质检退回: 订单 {order.order_no} - {remark}")
-    return order
+    return convert_order_to_response(order_full)
 
 
 @router.post("/{order_id}/complete", response_model=OrderResponse, summary="确认取件完成（审核员）")
@@ -457,9 +576,9 @@ async def complete_order(
     )
 
     db.commit()
-    db.refresh(order)
+    order_full = get_order_with_relations(db, order.id)
     logger.info(f"审核员 {current_user.username} 确认取件完成: 订单 {order.order_no}")
-    return order
+    return convert_order_to_response(order_full)
 
 
 @router.get("/{order_id}/logs", response_model=List[OrderStatusLogResponse], summary="获取订单状态流转日志")
@@ -472,21 +591,23 @@ async def get_order_logs(
     if not order:
         raise HTTPException(status_code=404, detail="订单不存在")
 
-    logs = db.query(OrderStatusLog).filter(OrderStatusLog.order_id == order_id).order_by(OrderStatusLog.created_at).all()
+    logs = db.query(OrderStatusLog).options(
+        joinedload(OrderStatusLog.operator)
+    ).filter(OrderStatusLog.order_id == order_id).order_by(OrderStatusLog.created_at).all()
 
     result = []
     for log in logs:
-        log_dict = {
+        operator_name = log.operator.full_name if log.operator else None
+        result.append({
             "id": log.id,
             "order_id": log.order_id,
             "from_status": log.from_status,
             "to_status": log.to_status,
             "operator_id": log.operator_id,
-            "operator_name": log.operator.full_name if log.operator else None,
+            "operator_name": operator_name,
             "remark": log.remark,
             "created_at": log.created_at
-        }
-        result.append(log_dict)
+        })
 
     return result
 
